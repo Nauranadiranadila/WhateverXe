@@ -14816,7 +14816,81 @@ bool tglCSBSerialize(void *,void *,OSSerialize *serializer) {
 }
 }
 
+// G15 (08/11): instrumentacao do repouso. Os panics do despertar (r113 EL-null / context-ID-mismatch) chegam com a pagina
+// de status da GPU invalida; para saber a ordem real, contam-se systemWillSleep/systemDidWake do IntelAccelerator,
+// o resetOnWake e os eventos de CSB desde o ultimo "vai dormir", e o panic sai com esses numeros (o que sobrevive).
+static mach_vm_address_t g15OrgWillSleep=0,g15OrgDidWake=0;
+static volatile uint32_t g15GpuAsleep=0;  // bit por motor (indice de tglCSBEngines)
+static volatile uint64_t g15CSBDropped=0,g15CSBStale=0,g15CSBFixed=0;
+static uint32_t g15StaleLog[8][8];static volatile uint32_t g15StaleN=0;
+// G15 (09/11): indice da lista ativa da Apple (streamer+0x50) e bit 0 do EXECLIST_STATUS por motor:
+// [0]=valido [1]=indice ao dormir [2]=EL_ST ao dormir [3]=indice no despertar (antes de restaurar) [4]=EL_ST no despertar
+static uint32_t g15ActiveIdx[6][5];
+static volatile uint64_t g15WillSleepN=0,g15DidWakeN=0,g15ResetWakeN=0,g15WillSleepT=0,g15DidWakeT=0,g15ResetWakeT=0,g15CSBSinceSleep=0,g15CSBSinceReset=0;
+static void g15SnapAll(unsigned phase);
+static void g15SaveActive();
+static uint64_t g15WrapWillSleep(void *acc) {
+ g15WillSleepN++;g15WillSleepT=mach_absolute_time();g15CSBSinceSleep=0;
+ g15SnapAll(0);
+ // Marca so depois do original: ele ainda espera a GPU ficar ociosa (eventos de conclusao precisam passar).
+ const auto r=reinterpret_cast<uint64_t (*)(void *)>(g15OrgWillSleep)(acc);
+ g15SaveActive();
+ g15GpuAsleep=0xFFFFFFFF;return r;
+}
+// G15 (08/11): registradores de cada motor (base = ponteiro do CSB - 0x3A0) em 3 momentos: 0 = cada tglCSBInitialize
+// antes do repouso (boot), 1 = no tglCSBInitialize do despertar, 2 = agora (refeito a cada publicacao). Registro
+// G15EngineRegs[fase][motor][16].
+static const uint16_t g15EngineOff[]={0x30,0x34,0x38,0x3C,0x80,0x98,0x9C,0xA8,0x180,0x234,0x238,0x29C,0x3A0,0x550};
+static uint32_t g15EngineRegs[3][6][16];
+static void g15EngineSnap(TGLCSBIO &io,unsigned phase) {
+ if(io.engine>=6 || io.pointerReg<0x3A0 || phase>2)return;
+ io.acquire();const auto base=io.pointerReg-0x3A0;auto r=g15EngineRegs[phase][io.engine];
+ r[0]=base;
+ for(unsigned i=0;i<arrsize(g15EngineOff);++i)r[1+i]=*reinterpret_cast<volatile uint32_t *>(io.bar+base+g15EngineOff[i]);
+ r[15]=*reinterpret_cast<volatile uint32_t *>(io.hwsp+0xBC);
+}
+static void g15SaveActive() {
+ for(unsigned e=0;e<6;++e)if(tglCSBEngines[e].streamer && tglCSBEngines[e].hardwareReady){
+  TGLCSBIO io(tglCSBEngines[e].streamer,0);if(io.engine>=6 || io.pointerReg<0x3A0)continue;io.acquire();
+  auto &a=g15ActiveIdx[io.engine];a[0]=1;a[1]=*reinterpret_cast<uint32_t *>(io.streamer+0x50);
+  a[2]=*reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg-0x3A0+0x234);
+ }
+}
+static void g15SnapAll(unsigned phase) {
+ for(unsigned e=0;e<6;++e)if(tglCSBEngines[e].streamer && tglCSBEngines[e].hardwareReady){TGLCSBIO io(tglCSBEngines[e].streamer,0);g15EngineSnap(io,phase);}
+}
+static void g15PublishSleep() {
+ g15SnapAll(2);
+ IORegistryEntry::getRegistryRoot()->setProperty("G15EngineRegs",g15EngineRegs,sizeof(g15EngineRegs));
+ uint64_t r[]={g15WillSleepN,g15DidWakeN,g15ResetWakeN,g15CSBDropped,g15CSBStale,g15CSBSinceReset,g15GpuAsleep};
+ IORegistryEntry::getRegistryRoot()->setProperty("G15SleepCounters",r,sizeof(r));
+ IORegistryEntry::getRegistryRoot()->setProperty("G15StaleLog",g15StaleLog,sizeof(g15StaleLog));
+ { uint64_t f=g15CSBFixed;IORegistryEntry::getRegistryRoot()->setProperty("G15CSBFixed",f,64); }
+}
+static uint64_t g15WrapDidWake(void *acc) {
+ g15DidWakeN++;g15DidWakeT=mach_absolute_time();
+ const auto ret=reinterpret_cast<uint64_t (*)(void *)>(g15OrgDidWake)(acc);
+ g15PublishSleep();return ret;
+}
+static uint64_t g15Since(uint64_t t) {
+ if(!t)return UINT64_MAX;uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-t,&ns);return ns/1000;
+}
+static void g15SleepPanic(const char *kind,const uint32_t *entry) {
+ if(!g15WillSleepN)return;
+ PANIC("igfx","G15-sono %s asleep=%x dropped=%llu stale=%llu entry=%x:%x willSleep=%llu didWake=%llu resetOnWake=%llu us_desde(willSleep=%llu didWake=%llu reset=%llu) csbDesdeSleep=%llu csbDesdeReset=%llu",
+  kind,(unsigned)g15GpuAsleep,g15CSBDropped,g15CSBStale,entry?entry[0]:0,entry?entry[1]:0,g15WillSleepN,g15DidWakeN,g15ResetWakeN,g15Since(g15WillSleepT),g15Since(g15DidWakeT),g15Since(g15ResetWakeT),
+  g15CSBSinceSleep,g15CSBSinceReset);
+}
+
 bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ {
+  KernelPatcher::RouteRequest g15routes[] {
+   {"__ZN16IntelAccelerator15systemWillSleepEv",g15WrapWillSleep,g15OrgWillSleep},
+   {"__ZN16IntelAccelerator13systemDidWakeEv",g15WrapDidWake,g15OrgDidWake}
+  };
+  const bool g15ok=patcher.routeMultiple(index,g15routes,2,address,size);patcher.clearError();
+  IORegistryEntry::getRegistryRoot()->setProperty("G15SleepTraceReady",g15ok);
+ }
  KernelPatcher::RouteRequest routes[] {
   {"__ZN26IGHardwareCommandStreamer54initEP22IOGraphicsAccelerator2P10IOWorkLoopP12IGScheduler510IGHwCsType",wrapTGLCSBInit,orgTGLCSBInit},
   {"__ZN26IGHardwareCommandStreamer511resetOnWakeEv",wrapTGLCSBWake,orgTGLCSBWake},
@@ -14915,13 +14989,67 @@ bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,un
  }
  return ok;
 }
-void XE::wrapTGLCSBWake(void *streamer) { tglCSBInitialize(streamer); }
+void XE::wrapTGLCSBWake(void *streamer) {
+ g15ResetWakeN++;g15ResetWakeT=mach_absolute_time();g15CSBSinceReset=0;
+ // G15 (08/11): o resetOnWake nativo so poe os ponteiros do CSB em 7 (modo de 6 eventos); NAO chamar (teste 9: panic
+ // "CSB12 native/software head mismatch"). O que falta no despertar e o modo: a GPU perde energia no repouso e o
+ // GFX_MODE volta ao padrao (6 eventos), mas o WhateverXe so liga o bit dos 12 eventos no initModeRegisters do boot;
+ // o consumidor de 12 lia as posicoes 6-11 com eventos velhos (panics EL-null/ID-mismatch dos testes 2-5). Religa o
+ // bit 3 (escrita mascarada 0x00080008, a mesma do boot) antes de reinicializar o CSB, com a GPU ainda sem trabalho.
+ {
+  static uint32_t calls=0;uint32_t rec[8]={++calls,0,0,0,0,0,0,0};
+  TGLCSBIO io(streamer,0);io.acquire();g15EngineSnap(io,1);
+  if(io.engine<6 && g15ActiveIdx[io.engine][0]) {
+   auto &a=g15ActiveIdx[io.engine];a[3]=*reinterpret_cast<uint32_t *>(io.streamer+0x50);
+   a[4]=*reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg-0x3A0+0x234);
+   // G15 (09/11): a GPU mantem o estado no Deep Idle (teste 11), inclusive o ponteiro de execlist atual; a Apple
+   // recomeca o indice dela e os eventos passam a apontar para a lista errada (teste 12). Restaura o de antes do repouso.
+   static int off=-1;if(off<0)off=checkKernelArgument("-wex-g15-wake-active-off");
+   if(!off && a[1]<2)*reinterpret_cast<uint32_t *>(io.streamer+0x50)=a[1];
+  }
+  IORegistryEntry::getRegistryRoot()->setProperty("G15ActiveIdx",g15ActiveIdx,sizeof(g15ActiveIdx));
+  auto reg=reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
+  const uint32_t before=*reg;
+  if(before!=~0U && !(before&8)){*reg=0x00080008;(void)*reg;}
+  rec[1]=io.engine;rec[2]=before;rec[3]=*reg;
+  rec[4]=*reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg);
+  static uint32_t last[6][4];if(io.engine<6){last[io.engine][0]=calls;last[io.engine][1]=before;last[io.engine][2]=rec[3];last[io.engine][3]=rec[4];}
+  IORegistryEntry::getRegistryRoot()->setProperty("G15WakeMode",last,sizeof(last));
+ }
+ // G15 (09/11, testes 11-13): no Deep Idle a GPU MANTEM o estado (registradores iguais ao dormir e ao despertar) e
+ // continua escrevendo eventos da posicao em que estava; o TGLCSB::initialize (feito para depois de um reset) forcava os
+ // ponteiros para 11 e a leitura ficava desalinhada para sempre (eventos de contextos ja retirados -> EL-null). Se o
+ // ponteiro de escrita do hardware e valido e bate com a copia na HWS, so alinha a leitura do WhateverXe e da Apple a
+ // ele (a GPU estava ociosa: nao ha evento pendente). Senao (estado de reset), inicializa como antes.
+ // -wex-g15-wake-resync-off volta sempre ao initialize.
+ {
+  TGLCSBIO io(streamer,0);io.acquire();
+  const uint32_t ptr=*reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg),wp=ptr&0xF;
+  const uint32_t hwsTail=*reinterpret_cast<volatile uint32_t *>(io.hwsp+0xBC);
+  static int off=-1;if(off<0)off=checkKernelArgument("-wex-g15-wake-resync-off");
+  static uint32_t rs[6][4];
+  auto &e=tglCSBEngines[io.engine];
+  const bool keep=!off && io.engine<6 && wp<TGLCSB::Capacity && hwsTail==wp && e.streamer==streamer && e.hardwareReady;
+  if(io.engine<6){rs[io.engine][0]++;rs[io.engine][1]=ptr;rs[io.engine][2]=hwsTail;rs[io.engine][3]=keep;}
+  if(keep) {
+   e.state.head=wp;e.state.error=TGLCSB::Error::None;
+   *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)=wp;++e.resets;
+  }
+  IORegistryEntry::getRegistryRoot()->setProperty("G15WakeResync",rs,sizeof(rs));
+  if(!keep)tglCSBInitialize(streamer);
+ }
+ for(unsigned i=0;i<arrsize(tglCSBEngines);++i)if(tglCSBEngines[i].streamer==streamer)__sync_fetch_and_and(&g15GpuAsleep,~(1U<<i));
+}
 void XE::wrapTGLCSBReset(void *streamer) {
  tglCSBInitialize(streamer);
  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(streamer);
 }
 void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
- TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];
+ g15CSBSinceSleep++;g15CSBSinceReset++;
+ // G15 (08/11): entre o systemWillSleep e o resetOnWake nao ha trabalho valido na GPU; os eventos que chegam (com a
+ // pagina de status velha/invalida) derrubavam o despertar (r113). Descarta; o resetOnWake reinicializa o CSB.
+ TGLCSBIO io(streamer,flags);
+ if(g15GpuAsleep&(1U<<io.engine)){g15CSBDropped++;return;}auto &engine=tglCSBEngines[io.engine];
  if (engine.streamer!=streamer ||
   *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)!=engine.state.head)
   PANIC("igfx","CSB12 native/software head mismatch e=%u",io.engine);
@@ -14955,6 +15083,39 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
    case TGLCSB::Handler::ElementSwitch: handler=2;break;
    case TGLCSB::Handler::ActiveToIdle: handler=3;break;
    default: return false;
+  }
+  // G15 (08/11): nos primeiros 30 s depois do resetOnWake, o 1o evento de troca de contexto chegava sem item na lista
+  // ativa (EL-null) ou com outro contexto (ID-mismatch) e o validador nativo dava panic. Pre-valida como o
+  // ContextStatusBufferValidate da Apple (lista em streamer+0x30+ativo*16; item->contexto+0x7C == id do evento) e,
+  // nessa janela, descarta o evento velho (contador g15CSBStale) em vez de derrubar o sistema.
+  if (g15WillSleepN && g15Since(g15ResetWakeT)<30000000ULL) {
+   const auto active=*reinterpret_cast<uint32_t *>(io.streamer+0x50);
+   const uint32_t want=(entry.identity>>5)&0x7FF;
+   // id do contexto do 1o item da lista l (UINT32_MAX = sem item/contexto)
+   auto listId=[&](uint32_t l)->uint32_t {
+    if (l>1) return UINT32_MAX;
+    void *item=*reinterpret_cast<void **>(io.streamer+0x30+l*16);
+    if (!item) return UINT32_MAX;
+    auto ctx=*reinterpret_cast<uint8_t **>(item);
+    return ctx ? *reinterpret_cast<uint32_t *>(ctx+0x7C) : UINT32_MAX;
+   };
+   bool stale=false;uint32_t fixed=0;
+   const uint32_t idA=listId(active),idB=listId(active^1);
+   if (handler==1 || handler==3) {
+    if (idA!=want) {
+     // G15 (09/11, teste 11): os eventos reprovados eram REAIS (stamps pendentes com o ring ocioso no gpuRestart).
+     // Se o evento bate com a OUTRA lista, o indice ativo ficou defasado no despertar: corrige e entrega.
+     if (active<2 && idB==want) {*reinterpret_cast<uint32_t *>(io.streamer+0x50)=active^1;fixed=1;g15CSBFixed++;}
+     else stale=true;
+    }
+   } else if (handler==2) {
+    stale=active>1 || !*reinterpret_cast<void **>(io.streamer+0x38+active*16);
+   }
+   if ((stale || fixed) && g15StaleN<8) {
+    auto r=g15StaleLog[g15StaleN++];r[0]=handler;r[1]=active;r[2]=want;r[3]=idA;r[4]=idB;r[5]=fixed|(stale<<1);
+    r[6]=entry.flags;r[7]=io.engine;
+   }
+   if (stale) {g15CSBStale++;++engine.consumed;return true;}
   }
   // Original validators still run inside handlers. No manufactured legacy
   // flags, forced bank promotion, or pretend completion for unsupported waits.
@@ -15518,6 +15679,7 @@ void XE::wrapTGLHostCSB(void *streamer,uint32_t *entry,uint32_t *index) {
 // Both routes run only AFTER the native validator has rejected list state.
 // Preserve failure, enriching the persisted panic rather than suppressing it.
 static void tglHostCSBFatal(const char *reason,const uint32_t *entry,void *failedStreamer) {
+ g15SleepPanic(reason,entry);
  if(!tglFatalLogStorage.claim())PANIC("igfx","concurrent CSB fatal: %s entry=%x:%x",reason,entry?entry[1]:0,entry?entry[0]:0);
  uint64_t before=0,writes=0,immediate=0,finalBad=0;
  for (uint32_t i=0;i<tglHost.maps && i<arrsize(tglHost.map);++i) {
