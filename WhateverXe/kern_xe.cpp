@@ -15042,9 +15042,15 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
  // G15 (08/11): entre o systemWillSleep e o resetOnWake nao ha trabalho valido na GPU; os eventos que chegam (com a
  // pagina de status velha/invalida) derrubavam o despertar (r113). Descarta; o resetOnWake reinicializa o CSB.
  TGLCSBIO io(streamer,flags);
- if(g15GpuAsleep&(1U<<io.engine)){g15CSBDropped++;return;}auto &engine=tglCSBEngines[io.engine];
+ auto &engine=tglCSBEngines[io.engine];
+ // G15 (11/11): nao mais sai sem chamar drain() quando dormindo. drain() so toca o HWSP
+ // (memoria do host) e um MMIO com acquire()/forcewake proprio quando precisa - o mesmo
+ // caminho que o driver nativo usa sem travar. Sair ANTES de drenar deixava o ponteiro
+ // hardware-visivel (streamer+0x1C04) sem avancar; se a interrupcao for por nivel, ela
+ // dispara de novo pra sempre (trava total, sem panic, ventoinha nunca para).
+ const bool asleep=(g15GpuAsleep&(1U<<io.engine))!=0;
  if (engine.streamer!=streamer ||
-  *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)!=engine.state.head)
+  (!asleep && *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)!=engine.state.head))
   PANIC("igfx","CSB12 native/software head mismatch e=%u",io.engine);
  auto consume=[&](const TGLCSB::Sample &sample) {
   const auto event=TGLCSB::classify(sample.raw);const auto entry=TGLCSB::legacyEntry(event);
@@ -15069,6 +15075,11 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
     __atomic_store_n(&r.ready,1,__ATOMIC_RELEASE);
    }
   }
+  // G15 (11/11): a amostra ja foi lida/apagada e o ponteiro ja avancou (acima); so falta
+  // decidir se despacha. Dormindo, a GPU nao tem trabalho valido (resetOnWake reinicializa
+  // o CSB no despertar) - descarta sem chamar o handler nativo, mas CONSOME (retorna true),
+  // nunca sai antes do drain() ja ter avancado o ponteiro.
+  if (asleep) {g15CSBDropped++;++engine.consumed;return true;}
   unsigned handler=4;
   switch (TGLCSB::handlerFor(event)) {
    case TGLCSB::Handler::IdleToActive: handler=0;break;
