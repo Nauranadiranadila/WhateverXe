@@ -6049,6 +6049,14 @@ IOReturn XE::wrapDisplay13FBEnableIRQ(IOService *controller) {
 		// Topology and latches the master off, so flips never complete (WindowServer watchdog).
 		// Stay hotplug-only like the multi-output path; the VBL callback re-arms pipe A once
 		// the transcoder really runs.
+		// G15 (12/11, diagnostic): hotplugOnly() itself can still fail Topology via its own
+		// consumersStopped() precondition if a plane/cursor/DSB Enable bit for pipe 0 survived
+		// Deep Idle unexpectedly. Capture those exact registers so a repeat fault is diagnosable
+		// without another blind reboot cycle.
+		uint64_t cs[12] {io.read(Display13FBIRQ::Driver),io.read(0x70008),io.read(0x70080),io.read(c.state.transcoders.function(0))};
+		for(unsigned n=0;n<5;++n)cs[4+n]=io.read(0x70180+0x100*n);
+		for(unsigned d=0;d<3;++d)cs[9+d]=io.read(Display13FBIRQ::DSBControl(0,d));
+		IORegistryEntry::getRegistryRoot()->setProperty("G15ConsumersStoppedDiag",cs,sizeof(cs));
 		c.status=c.state.enabled && !c.state.active && (io.read(Display13FBIRQ::Master)&Display13FBIRQ::Enable) ?
 			Display13FBIRQ::Status::Complete : Display13FBIRQ::hotplugOnly(io,c.state,false);
 	} else c.status=Display13FBIRQ::enable(io,c.state,excluded,adlnSharedGT(controller),1,callbackXE->adlnOutputWiring.hotplug(),callbackXE->adlnOutputWiring.typeC);
