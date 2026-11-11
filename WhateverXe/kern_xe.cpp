@@ -14827,14 +14827,16 @@ static uint32_t g15StaleLog[8][8];static volatile uint32_t g15StaleN=0;
 // [0]=valido [1]=indice ao dormir [2]=EL_ST ao dormir [3]=indice no despertar (antes de restaurar) [4]=EL_ST no despertar
 static uint32_t g15ActiveIdx[6][5];
 static volatile uint64_t g15WillSleepN=0,g15DidWakeN=0,g15ResetWakeN=0,g15WillSleepT=0,g15DidWakeT=0,g15ResetWakeT=0,g15CSBSinceSleep=0,g15CSBSinceReset=0;
-static void g15SnapAll(unsigned phase);
-static void g15SaveActive();
 static uint64_t g15WrapWillSleep(void *acc) {
  g15WillSleepN++;g15WillSleepT=mach_absolute_time();g15CSBSinceSleep=0;
- g15SnapAll(0);
  // Marca so depois do original: ele ainda espera a GPU ficar ociosa (eventos de conclusao precisam passar).
  const auto r=reinterpret_cast<uint64_t (*)(void *)>(g15OrgWillSleep)(acc);
- g15SaveActive();
+ // G15 (11/11): o snapshot de registradores MMIO (g15SnapAll/g15SaveActive) e so diagnostico; ler
+ // o BAR da GPU aqui corre com o power-down em andamento apos o original e pode travar o barramento
+ // sem panic (trava total, sem log). Guarda apenas o indice ativo (memoria do host, nao MMIO).
+ for(unsigned e=0;e<6;++e)if(tglCSBEngines[e].streamer && tglCSBEngines[e].hardwareReady){
+  auto &a=g15ActiveIdx[e];a[0]=1;a[1]=*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(tglCSBEngines[e].streamer)+0x50);
+ }
  g15GpuAsleep=0xFFFFFFFF;return r;
 }
 // G15 (08/11): registradores de cada motor (base = ponteiro do CSB - 0x3A0) em 3 momentos: 0 = cada tglCSBInitialize
@@ -14849,18 +14851,9 @@ static void g15EngineSnap(TGLCSBIO &io,unsigned phase) {
  for(unsigned i=0;i<arrsize(g15EngineOff);++i)r[1+i]=*reinterpret_cast<volatile uint32_t *>(io.bar+base+g15EngineOff[i]);
  r[15]=*reinterpret_cast<volatile uint32_t *>(io.hwsp+0xBC);
 }
-static void g15SaveActive() {
- for(unsigned e=0;e<6;++e)if(tglCSBEngines[e].streamer && tglCSBEngines[e].hardwareReady){
-  TGLCSBIO io(tglCSBEngines[e].streamer,0);if(io.engine>=6 || io.pointerReg<0x3A0)continue;io.acquire();
-  auto &a=g15ActiveIdx[io.engine];a[0]=1;a[1]=*reinterpret_cast<uint32_t *>(io.streamer+0x50);
-  a[2]=*reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg-0x3A0+0x234);
- }
-}
-static void g15SnapAll(unsigned phase) {
- for(unsigned e=0;e<6;++e)if(tglCSBEngines[e].streamer && tglCSBEngines[e].hardwareReady){TGLCSBIO io(tglCSBEngines[e].streamer,0);g15EngineSnap(io,phase);}
-}
 static void g15PublishSleep() {
- g15SnapAll(2);
+ // G15 (11/11): nao repete o passeio por todos os motores aqui (diagnostico puro); so o
+ // motor que de fato acordou (wrapTGLCSBWake, phase 1) le o MMIO dele, ja respondendo.
  IORegistryEntry::getRegistryRoot()->setProperty("G15EngineRegs",g15EngineRegs,sizeof(g15EngineRegs));
  uint64_t r[]={g15WillSleepN,g15DidWakeN,g15ResetWakeN,g15CSBDropped,g15CSBStale,g15CSBSinceReset,g15GpuAsleep};
  IORegistryEntry::getRegistryRoot()->setProperty("G15SleepCounters",r,sizeof(r));
